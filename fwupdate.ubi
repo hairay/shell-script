@@ -1,0 +1,221 @@
+#!/bin/sh
+
+info()  { echo -e "\x1b[1m* $@\x1b[0m" 1>&2; }
+err()   { echo -e "\x1b[31m$@\x1b[0m" 1>&2; }
+warn()  { echo -e "\x1b[33m$@\x1b[0m" 1>&2; }
+well()  { echo -e "\x1b[32m$@\x1b[0m" 1>&2; }
+abort() { E=$1; shift; err "$@"; exit $E; }
+
+ui_init() {
+   echo ui_init
+}
+ui_splash() {
+   echo ui_splash 
+}
+
+check_exist() {
+    echo -n checking "$1" ... 1>&2
+    [ -z "$1" ] && abort 1 " missing!"
+    [ ! -e "$1" ] && abort 1 " missing!"
+    well " ok"
+}
+
+check_prog_optional() {
+    [ -z "$1" ] && return 1
+    echo -n checking "$1" ... 1>&2
+    PROG=`which "$1" 2>/dev/null`
+    [ ! -x "${PROG}" ] && warn " missing!" && return 1
+    well " ok"
+    return 0
+}
+
+check_prog() {
+    check_prog_optional "$1"
+    E=$?
+    [ $E -eq 0 ] || exit $E
+}
+
+install_kernel() {
+    info install kernel
+    check_exist /upgrade/devtreelinux.brn
+    check_exist /dev/mtd1
+    check_prog flashcp
+	
+    ui_splash 1
+    if ! flashcp -v /upgrade/devtreelinux.brn /dev/mtd1
+    then
+	check_prog flash_eraseall
+	flash_eraseall /dev/mtd1
+	flashcp -v /upgrade/devtreelinux.brn /dev/mtd1
+    fi
+    sync
+    ui_splash 0
+}
+
+flash_ubi_image() {
+    IMG=$1
+    MTDx=$2
+    UBIx=$3
+    MTD="/dev/mtd${MTDx}"
+    UBI="/dev/ubi${UBIx}"
+
+    check_exist ${IMG}
+    check_exist ${MTD}
+    
+    ui_splash 1
+    if [ -c "${UBI}" ]
+    then
+	check_prog ubidetach
+	ubidetach -d ${UBIx} /dev/ubi_ctrl
+    fi
+    check_prog_optional ubiformat
+    if [ $? -eq 0 ]
+    then
+	ubiformat ${MTD} -y -f ${IMG}
+    else
+	check_prog flash_eraseall
+	# check_prog cat
+	check_prog dd
+	flash_eraseall ${MTD}
+	# cat ubi0.img > ${MTD}
+	dd if=${IMG} of=${MTD} bs=64K
+    fi
+    sync
+    ubiattach -m ${MTDx} -d ${UBIx} /dev/ubi_ctrl
+    ui_splash 0
+}
+
+create_empty_ubi() {
+    MTDx=$1
+    UBIx=$2
+    LABEL=$3
+
+    check_exist /dev/mtd${MTDx}
+    check_prog ubiattach
+    check_prog ubimkvol
+    
+    ui_splash 1
+    check_prog_optional ubiformat
+    if [ $? -eq 0 ]
+    then
+	ubiformat /dev/mtd${MTDx} -y
+    else
+	check_prog flash_eraseall
+	flash_eraseall /dev/mtd${MTDx}
+    fi
+    ubiattach -m ${MTDx} -d ${UBIx} /dev/ubi_ctrl
+    ubimkvol /dev/ubi${UBIx} -N ${LABEL} -m
+    sync
+    #[ -c /dev/ubi${UBIx} ] && ubidetach -d ${UBIx} /dev/ubi_ctrl
+    ui_splash 0
+}
+
+post_ubi_check() {
+    MTDx=$1
+    UBIx=$2
+    LABEL=$3
+    K=$4
+    [ -z $K ] && K=echo
+
+    info checking ${LABEL}:
+
+    ui_splash 1
+    mkdir -p /dev/shm/a
+    [ -c /dev/ubi${UBIx} ] && ubidetach -d ${UBIx} /dev/ubi_ctrl
+    (ubiattach -m ${MTDx} -d ${UBIx} /dev/ubi_ctrl \
+	&& (mount -t ubifs -o sync,noatime ubi${UBIx}:${LABEL} /dev/shm/a \
+		|| (ubidetach -d ${UBIx} /dev/ubi_ctrl && false))) || \
+    (ubiattach -m ${MTDx} -d ${UBIx} /dev/ubi_ctrl \
+	&& (mount -t ubifs -o sync,noatime ubi${UBIx}:${LABEL} /dev/shm/a \
+		  || (ubidetach -d ${UBIx} /dev/ubi_ctrl && false))) \
+	&& ($K /dev/shm/a) && umount /dev/shm/a
+    [ -c /dev/ubi${UBIx} ] && ubidetach -d ${UBIx} /dev/ubi_ctrl
+    ubiattach -m ${MTDx} -d ${UBIx} /dev/ubi_ctrl
+    ui_splash 0
+}
+
+fix_attr() {
+    WD=$1
+    info fix_attr ${WD}
+    install -v -o 2950 -g 2950 -m 0750 -d ${WD}
+}
+
+install_rootfs() {
+    info install rootfs
+    
+	mkdir /tmp/quasar
+	cd /tmp/quasar
+	ubiattach -m 4 -d 1 /dev/ubi_ctrl
+	mount -t ubifs -o sync,noatime ubi1:rootfs /tmp/quasar
+	if [ $? -ne 0 ]; then
+		create_empty_ubi 4 1 rootfs
+		sleep 5		
+		mount -t ubifs -o sync,noatime ubi1:rootfs /tmp/quasar
+	fi
+	# Attempt to write / file system.
+    if test -e /upgrade/quasar_rootfs.tar.bz2 ; then
+		echo "Found /upgrade/quasar_rootfs.tar.bz2"
+		cd /tmp/quasar
+		rm -rf * .*
+		tar xvjf /upgrade/quasar_rootfs.tar.bz2
+		cd /
+		sync
+		umount /tmp/quasar
+		post_ubi_check 4 1 rootfs
+    fi
+}
+
+install_system() {
+    info install rootfs
+
+    flash_ubi_image /upgrade/system.img 4 1
+    sleep 5
+    post_ubi_check 4 1 rootfs
+}
+
+install_settings() {
+    info install settings
+	
+	mkdir /tmp/settings
+	cd /tmp/settings
+	ubiattach -m 5 -d 2 /dev/ubi_ctrl
+	mount -t ubifs -o sync,noatime ubi2:settings /tmp/settings
+	if [ $? -ne 0 ]; then
+		mount -t jffs2 -o noatime,sync /dev/mtdblock5 /tmp/settings
+		if [ $? -eq 0 ]; then
+			mkdir /dev/shm/settings
+			cp -r /tmp/settings/* /dev/shm/settings
+			umount /tmp/settings
+		fi
+		create_empty_ubi 5 2 settings
+		sleep 5
+		mount -t ubifs -o sync,noatime ubi2:settings /tmp/settings
+	fi
+
+	if test -d /dev/shm/settings ; then
+		cp -r /dev/shm/settings/* /tmp/settings/
+	fi
+	# Attempt to write settings file system.
+    if test -e /upgrade/settings.tar.bz2 ; then
+		echo "Found /upgrade/settings.tar.bz2"
+		cd /tmp/settings
+		tar xvjf /upgrade/settings.tar.bz2
+		cd /
+		sync
+		umount /tmp/settings
+		post_ubi_check 5 2 settings
+    else
+		sync
+	    post_ubi_check 5 2 settings		
+    fi
+}
+
+info "start $(basename $0)"
+
+ui_init
+install_kernel
+install_system
+install_settings
+ui_init
+
+reboot
